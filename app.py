@@ -1,28 +1,28 @@
-import os
-import pymongo
-import streamlit as st
-from dotenv import load_dotenv
-from datetime import datetime
-import google.generativeai as gen_ai
 import atexit
+import datetime
 import hashlib
-import time
-from langchain_groq import ChatGroq
+import os
+from dotenv import load_dotenv
+import streamlit as st
+import pymongo
+from PyPDF2 import PdfReader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.chains.combine_documents import create_stuff_documents_chain
-from langchain_core.prompts import ChatPromptTemplate
-from langchain.chains import create_retrieval_chain
-from langchain_community.vectorstores import FAISS
-from langchain_community.document_loaders import PyPDFDirectoryLoader
-from langchain_google_genai import GoogleGenerativeAIEmbeddings  
-# Load environment variables from .env file
-dotenv_path = os.path.join(os.path.dirname(__file__), '.env')
-load_dotenv(dotenv_path)
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+import google.generativeai as genai
+from langchain.vectorstores import FAISS
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain.chains.question_answering import load_qa_chain
+from langchain.prompts import PromptTemplate
 
-# Get environment variables
+# Load environment variables
+load_dotenv()
+
+# Configure Streamlit page settings
+st.set_page_config(page_title="Chat with PDF using Gemini")
+
+# Error handling for missing API keys or MongoDB URI
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 MONGODB_URI = os.getenv("MONGODB_URI")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 if GOOGLE_API_KEY is None:
     st.error("Google API key not found. Please make sure it's set in your .env file.")
@@ -32,18 +32,7 @@ if MONGODB_URI is None:
     st.error("MongoDB URI not found. Please make sure it's set in your .env file.")
     st.stop()
 
-if GROQ_API_KEY is None:
-    st.error("GROQ API key not found. Please make sure it's set in your .env file.")
-    st.stop()
-
-# Configure Streamlit page settings
-st.set_page_config(
-    page_title="Chat with my AI!",
-    page_icon=":alien:",
-    layout="wide",
-)
-
-# Set up MongoDB connection
+# MongoDB connection and setup
 try:
     client = pymongo.MongoClient(MONGODB_URI)
     db = client["chatbot_db"]
@@ -69,8 +58,8 @@ def close_mongo_client():
 atexit.register(close_mongo_client)
 
 # Set up Google Gemini-Pro AI model
-gen_ai.configure(api_key=GOOGLE_API_KEY)
-model = gen_ai.GenerativeModel('gemini-pro')
+genai.configure(api_key=GOOGLE_API_KEY)
+model = genai.GenerativeModel('gemini-pro')
 
 # Function to hash passwords
 def hash_password(password):
@@ -90,97 +79,125 @@ def authenticate_user(username, password):
 
 # Function to save chat history
 def save_chat_history(username, question, answer):
-    chat_data = {"username": username, "question": question, "answer": answer, "timestamp": datetime.utcnow()}
+    chat_data = {"username": username, "question": question, "answer": answer, "timestamp": datetime.datetime.utcnow()}
     collection.insert_one(chat_data)
 
 # Function to load chat history
 def load_chat_history(username):
     return collection.find({"username": username}).sort("timestamp", pymongo.ASCENDING)
 
-# User authentication interface
-if "logged_in" not in st.session_state:
-    st.session_state.logged_in = False
-    st.session_state.username = None
+# PDF processing functions
+def get_pdf_text(pdf_docs):
+    text = ""
+    for pdf in pdf_docs:
+        pdf_reader = PdfReader(pdf)
+        for page in pdf_reader.pages:
+            text += page.extract_text()
+    return text
 
-if not st.session_state.logged_in:
-    st.sidebar.title("User Login")
+def get_text_chunks(text):
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=10000, chunk_overlap=1000)
+    chunks = text_splitter.split_text(text)
+    return chunks
 
-    register = st.sidebar.checkbox("Register")
-    if register:
-        username = st.sidebar.text_input("Username", key="register_username")
-        password = st.sidebar.text_input("Password", type="password", key="register_password")
-        if st.sidebar.button("Register"):
-            if user_collection.find_one({"username": username}):
-                st.sidebar.error("Username already exists")
-            else:
-                register_user(username, password)
-                st.sidebar.success("Registration successful. Please log in.")
-    else:
-        username = st.sidebar.text_input("Username", key="login_username")
-        password = st.sidebar.text_input("Password", type="password", key="login_password")
-        if st.sidebar.button("Login"):
-            if authenticate_user(username, password):
-                st.session_state.logged_in = True
-                st.session_state.username = username
-                st.sidebar.success("Login successful.")
-            else:
-                st.sidebar.error("Invalid username or password")
-else:
-    st.sidebar.write(f"Logged in as {st.session_state.username}")
-    if st.sidebar.button("Logout"):
+def get_vector_store(text_chunks):
+    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+    vector_store = FAISS.from_texts(text_chunks, embedding=embeddings)
+    vector_store.save_local("faiss_index")
+
+def get_conversational_chain():
+    prompt_template = """
+    Answer the question as detailed as possible from the provided context, make sure to provide all the details, if the answer is not in
+    provided context just say, "answer is not available in the context", don't provide the wrong answer\n\n
+    Context:\n {context}?\n
+    Question: \n{question}\n
+
+    Answer:
+    """
+
+    model = ChatGoogleGenerativeAI(model="gemini-pro", temperature=0.3)
+    prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
+    chain = load_qa_chain(model, chain_type="stuff", prompt=prompt)
+    return chain
+
+def user_input(user_question):
+    embeddings = GoogleGenerativeAIEmbeddings(model = "models/embedding-001")
+    
+    new_db = FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
+    docs = new_db.similarity_search(user_question)
+
+    chain = get_conversational_chain()
+
+    
+    response = chain(
+        {"input_documents":docs, "question": user_question}
+        , return_only_outputs=True)
+
+    print(response)
+    st.write("Reply: ", response["output_text"])
+
+# Main Streamlit app
+def main():
+    st.header("Chat with PDF using Gemini")
+
+    # User authentication interface
+    if "logged_in" not in st.session_state:
         st.session_state.logged_in = False
         st.session_state.username = None
-        st.experimental_rerun()
 
-    st.title("Gemma Model Document Q&A")
+    # Sidebar for login/logout
+    with st.sidebar:
+        if not st.session_state.logged_in:
+            st.title("User Login")
+            login_tab, register_tab = st.tabs(["Login", "Register"])
+            
+            with login_tab:
+                username = st.text_input("Username", key="login_username")
+                password = st.text_input("Password", type="password", key="login_password")
+                if st.button("Login"):
+                    if authenticate_user(username, password):
+                        st.session_state.logged_in = True
+                        st.session_state.username = username
+                        st.success("Login successful.")
+                        st.experimental_rerun()
+                    else:
+                        st.error("Invalid username or password")
+            
+            with register_tab:
+                new_username = st.text_input("New Username", key="register_username")
+                new_password = st.text_input("New Password", type="password", key="register_password")
+                if st.button("Register"):
+                    if user_collection.find_one({"username": new_username}):
+                        st.error("Username already exists")
+                    else:
+                        register_user(new_username, new_password)
+                        st.success("Registration successful. Please log in.")
+        else:
+            st.write(f"Logged in as {st.session_state.username}")
+            if st.button("Logout"):
+                st.session_state.logged_in = False
+                st.session_state.username = None
+                st.experimental_rerun()
 
-    llm = ChatGroq(groq_api_key=GROQ_API_KEY, model_name="Llama3-8b-8192")
+    # Main application (only shown when logged in)
+    if st.session_state.logged_in:
+        st.title("Gemma Model Document Q&A")
 
-    prompt = ChatPromptTemplate.from_template(
-    """
-    Answer the questions based on the provided context only.
-    Please provide the most accurate response based on the question
-    <context>
-    {context}
-    <context>
-    Questions: {input}
-    """
-    )
+        # File uploader
+        pdf_docs = st.file_uploader("Upload your PDF Files", accept_multiple_files=True)
+        
+        if pdf_docs:
+            if st.button("Process Documents"):
+                with st.spinner("Processing..."):
+                    raw_text = get_pdf_text(pdf_docs)
+                    text_chunks = get_text_chunks(raw_text)
+                    get_vector_store(text_chunks)
+                    st.success("Documents processed successfully!")
 
-    def vector_embedding():
-        if "vectors" not in st.session_state:
-            st.session_state.embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-            st.session_state.loader = PyPDFDirectoryLoader("./Documents")  # Data Ingestion
-            st.session_state.docs = st.session_state.loader.load()  # Document Loading
-            st.session_state.text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)  # Chunk Creation
-            st.session_state.final_documents = st.session_state.text_splitter.split_documents(st.session_state.docs[:20])  # splitting
-            st.session_state.vectors = FAISS.from_documents(st.session_state.final_documents, st.session_state.embeddings)  # vector OpenAI embeddings
+        # Q&A interface
+        user_question = st.text_input("Ask a question about your PDF:")
+        if user_question:
+            user_input(user_question)
 
-    if st.button("Documents Embedding"):
-        vector_embedding()
-        st.write("Vector Store DB is ready")
-
-    prompt1 = st.text_input("Enter Your Question From Documents")
-
-    if prompt1:
-        document_chain = create_stuff_documents_chain(llm, prompt)
-        retriever = st.session_state.vectors.as_retriever()
-        retrieval_chain = create_retrieval_chain(retriever, document_chain)
-        start = time.process_time()
-        response = retrieval_chain.invoke({'input': prompt1})
-        print("Response time:", time.process_time() - start)
-        st.write(response['answer'])
-
-        save_chat_history(st.session_state.username, prompt1, response['answer'])
-
-        with st.expander("Document Similarity Search"):
-            for i, doc in enumerate(response["context"]):
-                st.write(doc.page_content)
-                st.write("--------------------------------")
-
-    if st.button("Load Chat History"):
-        chat_history = load_chat_history(st.session_state.username)
-        for chat in chat_history:
-            st.write(f"Q: {chat['question']}")
-            st.write(f"A: {chat['answer']}")
-            st.write("--------------------------------")
+if __name__ == "__main__":
+    main()
