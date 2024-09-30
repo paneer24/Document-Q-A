@@ -6,7 +6,7 @@ Document QA Bot is an interactive tool that allows users to interact with docume
 * User-Friendly Interface: A Streamlit-based UI for easy interaction
 * Faster load time: It uses GROQ API it is able to utilize LPU(Language Processing Unit) that is able to handle computationally intensive applications with a sequential component to them such as LLMs.
 #Installation
-Follow these steps to set up the CSVWhiz Bot on your local machine:
+Follow these steps to set up the Document-QA-Bot on your local machine:
 1. **Clone the repository:**
     ```sh
     git clone https://github.com/yourusername/Document-QA-Bot.git
