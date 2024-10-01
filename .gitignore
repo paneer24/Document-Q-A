@@ -1,0 +1,8 @@
+# Ignore environment files that might contain secrets
+.env
+.env.local
+.env.*.local
+
+# Ignore any files that might accidentally contain secrets
+*.log
+*.bak
