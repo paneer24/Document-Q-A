@@ -2,6 +2,7 @@ import atexit
 import datetime
 import hashlib
 import os
+import time
 from dotenv import load_dotenv
 import streamlit as st
 import pymongo
@@ -9,10 +10,11 @@ from PyPDF2 import PdfReader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 import google.generativeai as genai
-from langchain.vectorstores import FAISS
+from langchain_community.vectorstores import FAISS
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.chains.question_answering import load_qa_chain
 from langchain.prompts import PromptTemplate
+from googlesearch import search
 
 # Load environment variables
 load_dotenv()
@@ -37,16 +39,7 @@ try:
     client = pymongo.MongoClient(MONGODB_URI)
     db = client["chatbot_db"]
     collection = db["chat_history"]
-    user_collection = db["users"]  # Collection for user credentials
-
-    # Ensure text index on 'text' field for full-text search
-    collection.create_index([("text", pymongo.TEXT)])
-except pymongo.errors.ConfigurationError as e:
-    st.error(f"Configuration error: {e}")
-    st.stop()
-except pymongo.errors.ServerSelectionTimeoutError as e:
-    st.error(f"Server selection timeout error: {e}")
-    st.stop()
+    user_collection = db["users"]
 except Exception as e:
     st.error(f"An unexpected error occurred: {e}")
     st.stop()
@@ -61,28 +54,31 @@ atexit.register(close_mongo_client)
 genai.configure(api_key=GOOGLE_API_KEY)
 model = genai.GenerativeModel('gemini-pro')
 
-# Function to hash passwords
+# Authentication functions
 def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
 
-# Function to register a new user
 def register_user(username, password):
     hashed_password = hash_password(password)
     user_data = {"username": username, "password": hashed_password}
     user_collection.insert_one(user_data)
 
-# Function to authenticate user
 def authenticate_user(username, password):
     hashed_password = hash_password(password)
     user = user_collection.find_one({"username": username, "password": hashed_password})
     return user is not None
 
-# Function to save chat history
-def save_chat_history(username, question, answer):
-    chat_data = {"username": username, "question": question, "answer": answer, "timestamp": datetime.datetime.utcnow()}
+# Chat history functions
+def save_chat_history(username, question, answer, response_time=None):
+    chat_data = {
+        "username": username,
+        "question": question,
+        "answer": answer,
+        "response_time": response_time,
+        "timestamp": datetime.datetime.utcnow()
+    }
     collection.insert_one(chat_data)
 
-# Function to load chat history
 def load_chat_history(username):
     return collection.find({"username": username}).sort("timestamp", pymongo.ASCENDING)
 
@@ -121,29 +117,52 @@ def get_conversational_chain():
     return chain
 
 def user_input(user_question):
-    embeddings = GoogleGenerativeAIEmbeddings(model = "models/embedding-001")
-    
+    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
     new_db = FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
     docs = new_db.similarity_search(user_question)
-
-    chain = get_conversational_chain()
-
     
+    chain = get_conversational_chain()
+    
+    start_time = time.process_time()
     response = chain(
-        {"input_documents":docs, "question": user_question}
-        , return_only_outputs=True)
-
-    print(response)
-    st.write("Reply: ", response["output_text"])
+        {"input_documents": docs, "question": user_question},
+        return_only_outputs=True
+    )
+    response_time = time.process_time() - start_time
+    
+    answer = response["output_text"]
+    
+    # Display answer and response time
+    st.write(f"**Answer:** {answer}")
+    st.write(f"**Response time:** {response_time:.2f} seconds")
+    
+    # Display document similarity search results
+    with st.expander("Document Similarity Search"):
+        for i, doc in enumerate(docs):
+            st.write(f"Document {i+1}:")
+            st.write(doc.page_content)
+            st.write("--------------------------------")
+    
+    # Google Search results
+    st.write("### For More Information:")
+    try:
+        google_results = list(search(user_question, num_results=4))
+        for result in google_results:
+            st.write(result)
+    except Exception as e:
+        st.error(f"Error during Google search: {e}")
+    
+    return answer, response_time, docs
 
 # Main Streamlit app
 def main():
     st.header("Chat with PDF using Gemini")
 
-    # User authentication interface
+    # Initialize session state
     if "logged_in" not in st.session_state:
         st.session_state.logged_in = False
         st.session_state.username = None
+        st.session_state.conversation = []
 
     # Sidebar for login/logout
     with st.sidebar:
@@ -159,7 +178,7 @@ def main():
                         st.session_state.logged_in = True
                         st.session_state.username = username
                         st.success("Login successful.")
-                        st.experimental_rerun()
+                        st.rerun()
                     else:
                         st.error("Invalid username or password")
             
@@ -172,17 +191,11 @@ def main():
                     else:
                         register_user(new_username, new_password)
                         st.success("Registration successful. Please log in.")
-        else:
-            st.write(f"Logged in as {st.session_state.username}")
-            if st.button("Logout"):
-                st.session_state.logged_in = False
-                st.session_state.username = None
-                st.experimental_rerun()
 
     # Main application (only shown when logged in)
     if st.session_state.logged_in:
-        st.title("Gemma Model Document Q&A")
-
+        st.write(f"Logged in as {st.session_state.username}")
+        
         # File uploader
         pdf_docs = st.file_uploader("Upload your PDF Files", accept_multiple_files=True)
         
@@ -197,7 +210,33 @@ def main():
         # Q&A interface
         user_question = st.text_input("Ask a question about your PDF:")
         if user_question:
-            user_input(user_question)
+            if os.path.exists("faiss_index"):
+                answer, response_time, docs = user_input(user_question)
+                
+                # Save to conversation history
+                st.session_state.conversation.append(f"Q: {user_question}")
+                st.session_state.conversation.append(f"A: {answer}")
+                
+                # Save to database
+                save_chat_history(st.session_state.username, user_question, answer, response_time)
+            else:
+                st.warning("Please process documents first.")
+
+        # Show conversation history
+        if st.button("Show History"):
+            st.write("### Conversation History")
+            chat_history = load_chat_history(st.session_state.username)
+            for chat in chat_history:
+                st.write(f"Q: {chat['question']}")
+                st.write(f"A: {chat['answer']}")
+                if 'response_time' in chat:
+                    st.write(f"Response time: {chat['response_time']:.2f} seconds")
+                st.write("---")
+
+        if st.button("Logout"):
+            st.session_state.logged_in = False
+            st.session_state.username = None
+            st.rerun()
 
 if __name__ == "__main__":
     main()
