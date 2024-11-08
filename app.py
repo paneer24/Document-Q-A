@@ -22,7 +22,7 @@ os.environ["GOOGLE_API_KEY"] = os.getenv("GOOGLE_API_KEY")
 
 st.title("Model Document Q&A (Gemma Model)")
 
-llm = ChatGroq(groq_api_key=groq_api_key, model_name="Llama3-8b-8192")
+llm = ChatGroq(groq_api_key=groq_api_key, model_name="llama3-70b-8192")
 
 prompt = ChatPromptTemplate.from_template(
     """
